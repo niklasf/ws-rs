@@ -5,7 +5,9 @@ use std::mem::replace;
 use std::net::SocketAddr;
 
 use bytes::{Buf, BufMut};
+use mio::Evented;
 use mio::tcp::TcpStream;
+use mio_uds::UnixStream;
 #[cfg(feature = "nativetls")]
 use native_tls::{
     HandshakeError, MidHandshakeTlsStream as MidHandshakeSslStream, TlsStream as SslStream,
@@ -71,6 +73,7 @@ impl<T: io::Write> TryWriteBuf for T {}
 use self::Stream::*;
 pub enum Stream {
     Tcp(TcpStream),
+    Unix(UnixStream),
     #[cfg(any(feature = "ssl", feature = "nativetls"))]
     Tls(TlsStream),
 }
@@ -78,6 +81,13 @@ pub enum Stream {
 impl Stream {
     pub fn tcp(stream: TcpStream) -> Stream {
         Tcp(stream)
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        match *self {
+            Tcp(ref sock) => sock.set_nodelay(nodelay),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(any(feature = "ssl", feature = "nativetls"))]
@@ -101,9 +111,10 @@ impl Stream {
         }
     }
 
-    pub fn evented(&self) -> &TcpStream {
+    pub fn evented(&self) -> &Evented {
         match *self {
             Tcp(ref sock) => sock,
+            Unix(ref stream) => stream,
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.evented(),
         }
@@ -111,7 +122,7 @@ impl Stream {
 
     pub fn is_negotiating(&self) -> bool {
         match *self {
-            Tcp(_) => false,
+            Tcp(_) | Unix(_) => false,
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.is_negotiating(),
         }
@@ -119,7 +130,7 @@ impl Stream {
 
     pub fn clear_negotiating(&mut self) -> Result<()> {
         match *self {
-            Tcp(_) => Err(Error::new(
+            Tcp(_) | Unix(_) => Err(Error::new(
                 Kind::Internal,
                 "Attempted to clear negotiating flag on non ssl connection.",
             )),
@@ -131,6 +142,7 @@ impl Stream {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match *self {
             Tcp(ref sock) => sock.peer_addr(),
+            Unix(_) => Err(io::ErrorKind::Other.into()), // makes no sense for unix socket
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.peer_addr(),
         }
@@ -139,6 +151,7 @@ impl Stream {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match *self {
             Tcp(ref sock) => sock.local_addr(),
+            Unix(_) => Err(std::io::ErrorKind::Other.into()), // makes no sense for unix socket
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.local_addr(),
         }
@@ -149,6 +162,7 @@ impl io::Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             Tcp(ref mut sock) => sock.read(buf),
+            Unix(ref mut stream) => stream.read(buf),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.read(buf),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
@@ -217,6 +231,7 @@ impl io::Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match *self {
             Tcp(ref mut sock) => sock.write(buf),
+            Unix(ref mut stream) => stream.write(buf),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.write(buf),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
@@ -285,6 +300,7 @@ impl io::Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match *self {
             Tcp(ref mut sock) => sock.flush(),
+            Unix(ref mut stream) => stream.flush(),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.flush(),
             #[cfg(any(feature = "ssl", feature = "nativetls"))]

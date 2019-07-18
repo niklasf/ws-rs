@@ -8,6 +8,7 @@ extern crate bytes;
 extern crate httparse;
 extern crate mio;
 extern crate mio_extras;
+extern crate mio_uds;
 #[cfg(feature = "ssl")]
 extern crate openssl;
 #[cfg(feature = "nativetls")]
@@ -51,6 +52,7 @@ use std::borrow::Borrow;
 use std::default::Default;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
 use mio::Poll;
 
@@ -323,6 +325,11 @@ where
         A: ToSocketAddrs,
     {
         self.bind(addr_spec).and_then(|server| server.run())
+    }
+
+    pub fn listen_unix<P: AsRef<Path>>(mut self, path: P) -> Result<WebSocket<F>> {
+        self.handler.listen_unix(&mut self.poll, path)?;
+        self.run()
     }
 
     /// Queue an outgoing connection on this WebSocket. This method may be called multiple times,

@@ -3,10 +3,12 @@ use std::io::{Error as IoError, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::usize;
+use std::path::Path;
 
 use mio;
 use mio::tcp::{TcpListener, TcpStream};
 use mio::{Poll, PollOpt, Ready, Token};
+use mio_uds::UnixListener;
 use mio_extras;
 
 use url::Url;
@@ -20,6 +22,7 @@ use connection::Connection;
 use factory::Factory;
 use slab::Slab;
 use result::{Error, Kind, Result};
+use stream::Stream;
 
 
 const QUEUE: Token = Token(usize::MAX - 3);
@@ -78,11 +81,25 @@ pub struct Timeout {
     event: Token,
 }
 
+enum Listener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+impl Listener {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match *self {
+            Listener::Tcp(ref listener) => listener.local_addr(),
+            Listener::Unix(_) => Err(std::io::ErrorKind::Other.into()), // makes no sense for unix socket
+        }
+    }
+}
+
 pub struct Handler<F>
 where
     F: Factory,
 {
-    listener: Option<TcpListener>,
+    listener: Option<Listener>,
     connections: Slab<Conn<F>>,
     factory: F,
     settings: Settings,
@@ -130,7 +147,14 @@ where
         let tcp = TcpListener::bind(addr)?;
         // TODO: consider net2 in order to set reuse_addr
         poll.register(&tcp, ALL, Ready::readable(), PollOpt::level())?;
-        self.listener = Some(tcp);
+        self.listener = Some(Listener::Tcp(tcp));
+        Ok(self)
+    }
+
+    pub fn listen_unix<P: AsRef<Path>>(&mut self, poll: &mut Poll, path: P) -> Result<&mut Handler<F>> {
+        let unix = UnixListener::bind(path)?;
+        poll.register(&unix, ALL, Ready::readable(), PollOpt::level())?;
+        self.listener = Some(Listener::Unix(unix));
         Ok(self)
     }
 
@@ -306,7 +330,7 @@ where
                         if settings.tcp_nodelay {
                             sock.set_nodelay(true)?
                         }
-                        entry.insert(Connection::new(tok, sock, handler, settings, connection_id));
+                        entry.insert(Connection::new(tok, Stream::Tcp(sock), handler, settings, connection_id));
                         break;
                     }
                 } else {
@@ -355,7 +379,7 @@ where
     }
 
     #[cfg(any(feature = "ssl", feature = "nativetls"))]
-    pub fn accept(&mut self, poll: &mut Poll, sock: TcpStream) -> Result<()> {
+    pub fn accept(&mut self, poll: &mut Poll, sock: Stream) -> Result<()> {
         let factory = &mut self.factory;
         let settings = self.settings;
 
@@ -411,7 +435,7 @@ where
     }
 
     #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
-    pub fn accept(&mut self, poll: &mut Poll, sock: TcpStream) -> Result<()> {
+    pub fn accept(&mut self, poll: &mut Poll, sock: Stream) -> Result<()> {
         let factory = &mut self.factory;
         let settings = self.settings;
 
@@ -523,14 +547,14 @@ where
 
     #[inline]
     fn schedule(&self, poll: &mut Poll, conn: &Conn<F>) -> Result<()> {
-        trace!(
+        /* trace!(
             "Scheduling connection to {} as {:?}",
             conn.socket()
                 .peer_addr()
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|_| "UNKNOWN".into()),
             conn.events()
-        );
+        ); */
         poll.reregister(
             conn.socket(),
             conn.token(),
@@ -558,11 +582,11 @@ where
         // established. It's possible that we may go inactive while in a connecting
         // state if the handshake fails.
         if !active {
-            if let Ok(addr) = self.connections[token.into()].socket().peer_addr() {
+            /* if let Ok(addr) = self.connections[token.into()].socket().peer_addr() {
                 debug!("WebSocket connection to {} disconnected.", addr);
             } else {
                 trace!("WebSocket connection to token={:?} disconnected.", token);
-            }
+            } */
             let handler = self.connections.remove(token.into()).consume();
             self.factory.connection_lost(handler);
         } else {
@@ -605,25 +629,39 @@ where
             }
             ALL => {
                 if events.is_readable() {
-                    match self.listener
-                        .as_ref()
-                        .expect("No listener provided for server websocket connections")
-                        .accept()
-                    {
-                        Ok((sock, addr)) => {
-                            info!("Accepted a new tcp connection from {}.", addr);
-                            if let Err(err) = self.accept(poll, sock) {
-                                error!("Unable to build WebSocket connection {:?}", err);
-                                if self.settings.panic_on_new_connection {
-                                    panic!("Unable to build WebSocket connection {:?}", err);
+                    match self.listener.as_ref().expect("No listener provided for server websocket connections") {
+                        Listener::Tcp(listener) =>
+                            match listener.accept() {
+                                Ok((sock, addr)) => {
+                                    info!("Accepted a new tcp connection from {}.", addr);
+                                    if let Err(err) = self.accept(poll, Stream::Tcp(sock)) {
+                                        error!("Unable to build WebSocket connection {:?}", err);
+                                        if self.settings.panic_on_new_connection {
+                                            panic!("Unable to build WebSocket connection {:?}", err);
+                                        }
+                                    }
                                 }
+                                Err(err) => error!(
+                                    "Encountered an error {:?} while accepting tcp connection.",
+                                    err
+                                ),
+                            },
+                        Listener::Unix(listener) =>
+                            match listener.accept() {
+                                Ok(Some((stream, addr))) => {
+                                    if let Err(err) = self.accept(poll, Stream::Unix(stream)) {
+                                        if self.settings.panic_on_new_connection {
+                                            panic!("Unable to build WebSocket connection {:?}", err);
+                                        }
+                                    }
+                                }
+                                Ok(None) => (),
+                                Err(err) => error!(
+                                    "Encountered an error {:?} while accepting unix connection.",
+                                    err
+                                ),
                             }
-                        }
-                        Err(err) => error!(
-                            "Encountered an error {:?} while accepting tcp connection.",
-                            err
-                        ),
-                    }
+                     }
                 }
             }
             TIMER => while let Some(t) = self.timer.poll() {

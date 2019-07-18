@@ -26,6 +26,7 @@ rand = "0.6"
 sha-1 = "0.8.0"
 slab = "0.4"
 url = "1.7.0"
+mio-uds = "0.6.7"
 
 [dependencies.libc]
 optional = true

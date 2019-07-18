@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::str::from_utf8;
 
 use mio::tcp::TcpStream;
-use mio::{Ready, Token};
+use mio::{Evented, Ready, Token};
 use mio_extras::timer::Timeout;
 use url;
 
@@ -104,14 +104,14 @@ where
 {
     pub fn new(
         tok: Token,
-        sock: TcpStream,
+        stream: Stream,
         handler: H,
         settings: Settings,
         connection_id: u32,
     ) -> Connection<H> {
         Connection {
             token: tok,
-            socket: Stream::tcp(sock),
+            socket: stream,
             state: Connecting(
                 Cursor::new(Vec::with_capacity(2048)),
                 Cursor::new(Vec::with_capacity(2048)),
@@ -195,7 +195,7 @@ where
         self.token
     }
 
-    pub fn socket(&self) -> &TcpStream {
+    pub fn socket(&self) -> &Evented {
         self.socket.evented()
     }
 
